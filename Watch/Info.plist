@@ -28,6 +28,10 @@
 	</array>
 	<key>WKApplication</key>
 	<true/>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>physical-therapy</string>
+	</array>
 	<key>WKCompanionAppBundleIdentifier</key>
 	<string>$(BUNDLE_ID_PREFIX).watchcam</string>
 	<key>WKRunsIndependentlyOfCompanionApp</key>

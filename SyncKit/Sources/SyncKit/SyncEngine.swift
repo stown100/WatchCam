@@ -58,11 +58,15 @@ public struct SyncConfiguration: Sendable {
 
 /// Synchronizes a target recording (watch audio) to a reference (iPhone video's own audio).
 public enum SyncEngine {
-    /// - Parameter coarseOffset: clock-based estimate of `targetTime - referenceTime`, if known.
+    /// - Parameters:
+    ///   - coarseOffset: clock-based estimate of `targetTime - referenceTime`, if known.
+    ///   - soundSpan: the part of the target known to hold real sound, in seconds of the target.
+    ///     Inserted silence can't be aligned with anything, so analysis stays away from it.
     public static func synchronize(
         reference: URL,
         target: URL,
         coarseOffset: Double?,
+        soundSpan: ClosedRange<Double>? = nil,
         configuration: SyncConfiguration = SyncConfiguration()
     ) async throws -> SyncResult {
         let rate = configuration.analysisSampleRate
@@ -74,8 +78,9 @@ public enum SyncEngine {
         let targetRange = try await AudioDecoder.audioTimeRange(of: target)
 
         // Part of the reference that the (coarsely shifted) target covers.
-        let overlapStart = max(referenceRange.lowerBound, targetRange.lowerBound - coarse)
-        let overlapEnd = min(referenceRange.upperBound, targetRange.upperBound - coarse)
+        let soundRange = soundSpan?.clamped(to: targetRange) ?? targetRange
+        let overlapStart = max(referenceRange.lowerBound, soundRange.lowerBound - coarse)
+        let overlapEnd = min(referenceRange.upperBound, soundRange.upperBound - coarse)
         guard overlapEnd - overlapStart >= 2 else { return fallback }
 
         let windowLength = min(configuration.windowDuration, overlapEnd - overlapStart)

@@ -174,10 +174,12 @@ private struct WatchBadge: View {
 
     private var text: String {
         if coordinator.phase == .recording, !coordinator.recordingUsesWatch { return "Только iPhone" }
+        if let note = coordinator.watchRecordingNote { return note.text }
         switch coordinator.watchState {
         case .notPaired: return "Нет часов"
         case .appNotInstalled: return "Нет приложения"
-        case .unreachable: return "Недоступны"
+        // Usually it's just the app on the watch being off screen: live messages only work while it's on.
+        case .unreachable: return "Откройте WatchCam"
         case .appNotActive: return "Откройте WatchCam"
         case .ready: return "Готовы"
         case .recording: return "Пишут звук"
@@ -185,7 +187,14 @@ private struct WatchBadge: View {
     }
 
     private var color: Color {
-        switch coordinator.watchState {
+        if let note = coordinator.watchRecordingNote {
+            return switch note.kind {
+            case .fine: .red
+            case .unknown: .yellow
+            case .problem: .orange
+            }
+        }
+        return switch coordinator.watchState {
         case .ready: .green
         case .recording: .red
         case .appNotActive: .yellow
@@ -404,8 +413,10 @@ private struct LastTakeBanner: View {
     }
 
     private func text(for session: RecordingSession) -> String {
-        if session.status == .waitingForWatch, let progress = coordinator.watchTransferProgress {
-            return "Звук с часов: \(Int(progress * 100))%"
+        if session.status == .waitingForWatch {
+            if let progress = coordinator.watchTransferProgress { return "Звук с часов: \(Int(progress * 100))%" }
+            // watchOS may hold the file while the watch is locked or the app is off screen.
+            return "Ждём звук: откройте WatchCam на часах"
         }
         if coordinator.processor.busy.contains(session.id), session.status == .ready {
             return "Сохранение в Фото…"

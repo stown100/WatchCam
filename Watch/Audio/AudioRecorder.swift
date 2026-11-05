@@ -7,16 +7,20 @@ import os
 /// AVAudioEngine (rather than AVAudioRecorder) gives a host-clock timestamp for every buffer,
 /// which tells exactly when the first sample was captured and lets us fill interruptions
 /// with silence so the file timeline never drifts from real time.
+///
+/// The file is always uncompressed PCM. Compressed audio needs a final step to become readable,
+/// and that step doesn't happen if the app dies. PCM stays readable up to the last write, and it
+/// costs almost no CPU, which matters while running in the background.
 final class AudioRecorder {
     struct Result {
         var url: URL
-        var format: WatchAudioFormat
         var sampleRate: Double
         var hardwareSampleRate: Double
         var startHostTime: Double
         var startWallTime: Date
         var duration: Double
         var silenceInserted: Double
+        var gaps: [AudioGap]
     }
 
     enum RecorderError: LocalizedError {
@@ -31,6 +35,9 @@ final class AudioRecorder {
         }
     }
 
+    /// No microphone data for this long, in seconds, means capture has stopped.
+    static let stallTime = 2.0
+
     /// Input level in dBFS, delivered on the main queue about 10 times per second.
     var onLevel: ((Float) -> Void)?
 
@@ -41,14 +48,16 @@ final class AudioRecorder {
     // Guarded by `lock`: touched from the tap thread and from the main thread.
     private var file: AVAudioFile?
     private var url: URL?
-    private var format: WatchAudioFormat = .aac
     private var hardwareSampleRate: Double = 0
     private var startHostTime: Double?
     private var startWallTime: Date?
     private var nextExpectedHostTime: Double?
     private var framesWritten: AVAudioFramePosition = 0
     private var silenceFrames: AVAudioFramePosition = 0
+    private var gaps: [AudioGap] = []
     private var lastLevelTime: Double = 0
+    private var lastBufferTime: Double = 0
+    private var writeFailures = 0
 
     private var observers: [NSObjectProtocol] = []
 
@@ -58,6 +67,8 @@ final class AudioRecorder {
         return file != nil
     }
 
+    var isEngineRunning: Bool { engine.isRunning }
+
     /// Host time of the first captured sample, once known.
     var firstSampleHostTime: Double? {
         lock.lock()
@@ -65,7 +76,21 @@ final class AudioRecorder {
         return startHostTime
     }
 
-    func start(url: URL, format requestedFormat: WatchAudioFormat) throws {
+    /// How long the microphone has been quiet, counted from the start. `nil` when not recording.
+    var secondsSinceLastBuffer: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return file == nil ? nil : HostClock.now() - lastBufferTime
+    }
+
+    /// The recording so far. `nil` until the first sample arrives.
+    var progress: Result? {
+        lock.lock()
+        defer { lock.unlock() }
+        return makeResult()
+    }
+
+    func start(url: URL) throws {
         guard !isRecording else { throw RecorderError.alreadyRecording }
 
         // watchOS doesn't allow choosing the sample rate: we record at whatever the hardware delivers
@@ -79,19 +104,21 @@ final class AudioRecorder {
         logger.info("Audio session sample rate: \(session.sampleRate) Hz, input format: \(inputFormat.description, privacy: .public)")
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else { throw RecorderError.noInput }
 
-        let (file, actualFormat) = try Self.makeFile(url: url, format: requestedFormat, sampleRate: inputFormat.sampleRate)
-        logger.info("Recording \(actualFormat.rawValue, privacy: .public) at \(inputFormat.sampleRate) Hz to \(url.lastPathComponent, privacy: .public)")
+        let file = try Self.makeFile(url: url, sampleRate: inputFormat.sampleRate)
+        Journal.log("recording to \(url.lastPathComponent) at \(inputFormat.sampleRate) Hz, protection \(Self.protection(of: url))")
 
         lock.lock()
         self.file = file
         self.url = url
-        self.format = actualFormat
         self.hardwareSampleRate = session.sampleRate
         startHostTime = nil
         startWallTime = nil
         nextExpectedHostTime = nil
         framesWritten = 0
         silenceFrames = 0
+        gaps = []
+        lastBufferTime = HostClock.now()
+        writeFailures = 0
         lock.unlock()
 
         input.installTap(onBus: 0, bufferSize: 4_096, format: inputFormat) { [weak self] buffer, time in
@@ -117,29 +144,32 @@ final class AudioRecorder {
 
         lock.lock()
         let file = self.file
+        let result = makeResult()
         self.file = nil
-        let result: Result? = {
-            guard let url, let file, let startHostTime, let startWallTime else { return nil }
-            let rate = file.processingFormat.sampleRate
-            return Result(
-                url: url,
-                format: format,
-                sampleRate: rate,
-                hardwareSampleRate: hardwareSampleRate,
-                startHostTime: startHostTime,
-                startWallTime: startWallTime,
-                duration: Double(framesWritten) / rate,
-                silenceInserted: Double(silenceFrames) / rate
-            )
-        }()
         lock.unlock()
 
-        // Closing the file writes the final header and packet table.
+        // Closing the file writes the final header.
         if #available(watchOS 11.0, *) {
             file?.close()
         }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         return result
+    }
+
+    /// Caller holds `lock`.
+    private func makeResult() -> Result? {
+        guard let url, let file, let startHostTime, let startWallTime else { return nil }
+        let rate = file.processingFormat.sampleRate
+        return Result(
+            url: url,
+            sampleRate: rate,
+            hardwareSampleRate: hardwareSampleRate,
+            startHostTime: startHostTime,
+            startWallTime: startWallTime,
+            duration: Double(framesWritten) / rate,
+            silenceInserted: Double(silenceFrames) / rate,
+            gaps: gaps
+        )
     }
 
     // MARK: - Tap
@@ -153,6 +183,7 @@ final class AudioRecorder {
         lock.lock()
         defer { lock.unlock() }
         guard let file else { return }
+        lastBufferTime = HostClock.now()
 
         if startHostTime == nil {
             startHostTime = hostTime
@@ -171,7 +202,10 @@ final class AudioRecorder {
             try file.write(from: mono)
             framesWritten += AVAudioFramePosition(frameCount)
         } catch {
-            logger.error("Write failed: \(error.localizedDescription, privacy: .public)")
+            writeFailures += 1
+            if writeFailures <= 3 || writeFailures % 100 == 0 {
+                Journal.log("write failed (\(writeFailures) so far): \(error.localizedDescription)")
+            }
         }
 
         if hostTime - lastLevelTime >= 0.1 {
@@ -185,6 +219,8 @@ final class AudioRecorder {
 
     /// Caller holds `lock`.
     private func writeSilence(frames: AVAudioFramePosition, to file: AVAudioFile) {
+        let rate = file.processingFormat.sampleRate
+        gaps.append(AudioGap(start: Double(framesWritten) / rate, duration: Double(frames) / rate))
         let chunk: AVAudioFramePosition = 4_096
         var remaining = frames
         while remaining > 0 {
@@ -197,7 +233,7 @@ final class AudioRecorder {
         }
         framesWritten += frames
         silenceFrames += frames
-        logger.warning("Inserted \(Double(frames) / file.processingFormat.sampleRate) s of silence after a gap")
+        Journal.log(String(format: "microphone came back: %.1f s of silence inserted", Double(frames) / rate))
     }
 
     // MARK: - Interruptions
@@ -205,25 +241,45 @@ final class AudioRecorder {
     private func observeInterruptions() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
-            guard let self, self.isRecording,
-                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let reason = note.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+            let began = raw.flatMap(AVAudioSession.InterruptionType.init) == .began
+            Journal.log("audio interruption \(began ? "began" : "ended"), reason \(reason.map(String.init) ?? "none")")
+            guard let self, self.isRecording, !began, !self.engine.isRunning else { return }
             self.restartEngine()
         })
         observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-            guard let self, self.isRecording else { return }
+            Journal.log("audio engine configuration changed")
+            guard let self, self.isRecording, !self.engine.isRunning else { return }
             self.restartEngine()
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { note in
+            let reason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Journal.log("audio route changed, reason \(reason.map(String.init) ?? "none")")
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { _ in
+            Journal.log("audio services were reset")
         })
     }
 
+    /// Starts the microphone again if it went quiet.
+    ///
+    /// watchOS only allows this while the app is on screen, so it can't help in the background:
+    /// the caller tries when the user comes back. Until then the iPhone is told, and the gap
+    /// gets filled from the iPhone's own sound afterwards.
+    func restartIfStalled() {
+        guard let quiet = secondsSinceLastBuffer, quiet >= Self.stallTime else { return }
+        restartEngine()
+    }
+
     private func restartEngine() {
-        guard !engine.isRunning else { return }
         do {
+            if engine.isRunning { engine.stop() }
             try AVAudioSession.sharedInstance().setActive(true)
             try engine.start()
-            logger.info("Engine restarted after interruption")
+            Journal.log("engine restarted")
         } catch {
-            logger.error("Engine restart failed: \(error.localizedDescription, privacy: .public)")
+            Journal.log("engine restart failed: \(error.localizedDescription)")
         }
     }
 
@@ -234,21 +290,7 @@ final class AudioRecorder {
 
     // MARK: - File
 
-    private static func makeFile(url: URL, format: WatchAudioFormat, sampleRate: Double) throws -> (AVAudioFile, WatchAudioFormat) {
-        if format == .aac {
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: sampleRate,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateStrategyKey: AVAudioBitRateStrategy_Variable,
-                AVEncoderAudioQualityForVBRKey: AVAudioQuality.max.rawValue,
-            ]
-            if let file = try? AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false) {
-                return (file, .aac)
-            }
-            // Some sample rates have no AAC encoder configuration: fall back to lossless.
-            try? FileManager.default.removeItem(at: url)
-        }
+    private static func makeFile(url: URL, sampleRate: Double) throws -> AVAudioFile {
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: sampleRate,
@@ -259,6 +301,38 @@ final class AudioRecorder {
             AVLinearPCMIsNonInterleaved: false,
         ]
         let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-        return (file, .pcm)
+        // The file must stay writable after the watch locks.
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+        return file
+    }
+
+    private static func protection(of url: URL) -> String {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.protectionKey] as? FileProtectionType)?.rawValue ?? "unknown"
+    }
+
+    /// Makes a finished recording smaller for the trip to the phone.
+    /// - Returns: `false` if this sample rate has no AAC encoder configuration.
+    static func compressToAAC(input: URL, output: URL) throws -> Bool {
+        let source = try AVAudioFile(forReading: input)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: source.processingFormat.sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateStrategyKey: AVAudioBitRateStrategy_Variable,
+            AVEncoderAudioQualityForVBRKey: AVAudioQuality.max.rawValue,
+        ]
+        guard let destination = try? AVAudioFile(forWriting: output, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: 16_384) else { return false }
+        while source.framePosition < source.length {
+            try source.read(into: buffer, frameCount: buffer.frameCapacity)
+            guard buffer.frameLength > 0 else { break }
+            try destination.write(from: buffer)
+        }
+        // Closing the file makes it readable. Before watchOS 11 that happens when it's released.
+        if #available(watchOS 11.0, *) {
+            destination.close()
+        }
+        return true
     }
 }

@@ -46,15 +46,35 @@ final class WatchModel {
     /// Updated from the scene phase. Recording can only *start* while the app is active.
     var isAppActive = false {
         didSet {
-            guard isAppActive, !oldValue else { return }
+            guard isAppActive != oldValue else { return }
+            Journal.log("app \(isAppActive ? "on screen" : "off screen"), locked \(Journal.isLocked.map(String.init) ?? "unknown")")
+            guard isAppActive else { return }
             lastHeartbeat = 0
+            Journal.prepareLockProbe()
             requestMicrophonePermissionIfNeeded()
             resendPendingRecordings()
+            // Only possible on screen: pick up what couldn't be done in the background.
+            if phase != .idle {
+                keepAlive.start()
+                recorder.restartIfStalled()
+            }
         }
     }
 
+    /// While recording: the microphone is really delivering sound.
+    private(set) var isCapturing = true
+
     @ObservationIgnored private let recorder = AudioRecorder()
+    @ObservationIgnored private let keepAlive = RecordingKeepAlive()
     @ObservationIgnored private let link = WatchLink()
+    /// What to send the current recording in.
+    @ObservationIgnored private var requestedFormat = WatchAudioFormat.aac
+    @ObservationIgnored private var compressing: Set<UUID> = []
+    /// Takes with nothing to send, for the phone to stop waiting.
+    @ObservationIgnored private var lostRecordings: [UUID] = []
+    @ObservationIgnored private var lastCheckpoint: Double = 0
+    @ObservationIgnored private var lastDiaryLine: Double = 0
+    @ObservationIgnored private var lastRestartAttempt: Double = 0
     @ObservationIgnored private var sessionID: UUID?
     @ObservationIgnored private var clockSamples: [ClockSample] = []
     @ObservationIgnored private var timer: Timer?
@@ -103,7 +123,8 @@ final class WatchModel {
         }
         link.activate()
 
-        PendingRecordings.removeOrphans(except: nil)
+        Journal.log("app launched")
+        recoverInterruptedRecordings()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -214,7 +235,7 @@ final class WatchModel {
 
     private func stopFromWatch() {
         guard let id = sessionID else { return }
-        finishRecording()
+        finishRecording(because: "stopped on the watch")
         link.send(.requestStop(sessionID: id)) { [weak self] reply, _ in
             // If the live message didn't get through, queue it: it arrives when the phone wakes up.
             if reply == nil { self?.link.sendQueued(.requestStop(sessionID: id)) }
@@ -247,7 +268,7 @@ final class WatchModel {
 
     private func handleRemoteStop(_ id: UUID) {
         guard sessionID == id else { return }
-        finishRecording()
+        finishRecording(because: "stop message from the phone")
     }
 
     private func apply(_ context: PhoneContext) {
@@ -256,21 +277,27 @@ final class WatchModel {
             UserDefaults.standard.set(audioFormat.rawValue, forKey: Self.audioFormatKey)
         }
         if let sessionID, context.stoppedSessionIDs.contains(sessionID) {
-            finishRecording()
+            finishRecording(because: "stop in the phone's context")
         }
     }
 
     // MARK: - Recording
 
     private func beginRecording(_ id: UUID, format: WatchAudioFormat) throws {
-        try recorder.start(url: PendingRecordings.audioURL(for: id), format: format)
+        try recorder.start(url: PendingRecordings.audioURL(for: id))
+        keepAlive.start()
+        requestedFormat = format
         sessionID = id
         recordingStartedAt = Date()
         clockSamples = []
         phoneMismatchCount = 0
         levelDB = -160
+        isCapturing = true
+        lastCheckpoint = 0
+        lastDiaryLine = 0
         // A quick burst of pings right after the start gives a good clock estimate early.
         burstUntil = HostClock.now() + 1.5
+        Journal.log("recording \(id) started, locked \(Journal.isLocked.map(String.init) ?? "unknown")")
     }
 
     private func abortRecording() {
@@ -279,27 +306,66 @@ final class WatchModel {
         sessionID = nil
         recordingStartedAt = nil
         phase = .idle
+        Journal.log("recording aborted")
+        stopKeepAliveIfDone()
     }
 
     /// Stops the microphone, saves metadata and queues the file for transfer.
-    private func finishRecording() {
+    private func finishRecording(because reason: String) {
         guard let id = sessionID else { return }
+        Journal.log("stopping: \(reason)")
         let result = recorder.stop()
+        let format = requestedFormat
+        let info = result.map { makeInfo(id, from: $0) }
         sessionID = nil
         recordingStartedAt = nil
         phase = .idle
         levelDB = -160
+        isCapturing = true
         WKInterfaceDevice.current().play(.stop)
 
-        guard let result else {
+        guard let info else {
+            // The microphone never gave a single sample.
+            Journal.log("recording \(id) ended with no sound at all")
             PendingRecordings.remove(id)
+            link.sendQueued(.recordingLost(sessionID: id))
             message = "Запись со звуком не сохранилась."
+            stopKeepAliveIfDone()
             return
         }
-        let samples = clockSamples.sorted { $0.delay < $1.delay }.prefix(40)
-        let info = WatchRecordingInfo(
+        Journal.log(String(format: "recording %@ finished: %.1f s, %.1f s of silence", id.uuidString, info.duration, info.silenceInserted))
+        // Safe as it is from here on, whatever happens during the compression.
+        PendingRecordings.save(info)
+        guard format == .aac else {
+            send(info)
+            return
+        }
+        compressing.insert(id)
+        Task {
+            let compressed = await Task.detached(priority: .userInitiated) { PendingRecordings.compress(info) }.value
+            compressing.remove(id)
+            Journal.log("compressed: \(compressed != nil)")
+            send(compressed ?? info)
+        }
+    }
+
+    private func send(_ info: WatchRecordingInfo) {
+        link.transfer(info, from: PendingRecordings.audioURL(for: info.sessionID))
+        updateTransfers()
+        Journal.log("transfer of \(info.sessionID) queued, locked \(Journal.isLocked.map(String.init) ?? "unknown")")
+        publishStatusIfOffScreen()
+        stopKeepAliveIfDone()
+    }
+
+    /// From here the system carries the file over: the app is free to be suspended.
+    private func stopKeepAliveIfDone() {
+        if sessionID == nil, compressing.isEmpty { keepAlive.stop() }
+    }
+
+    private func makeInfo(_ id: UUID, from result: AudioRecorder.Result) -> WatchRecordingInfo {
+        WatchRecordingInfo(
             sessionID: id,
-            format: result.format,
+            format: .pcm,
             fileExtension: result.url.pathExtension,
             sampleRate: result.sampleRate,
             hardwareSampleRate: result.hardwareSampleRate,
@@ -307,11 +373,65 @@ final class WatchModel {
             audioStartWallTime: result.startWallTime,
             duration: result.duration,
             silenceInserted: result.silenceInserted,
-            clockSamples: Array(samples)
+            clockSamples: Array(clockSamples.sorted { $0.delay < $1.delay }.prefix(40)),
+            gaps: result.gaps.isEmpty ? nil : result.gaps
         )
-        PendingRecordings.save(info)
-        link.transfer(info, from: result.url)
-        updateTransfers()
+    }
+
+    /// The app died during a recording last time: what it saved goes to the phone like any other file.
+    private func recoverInterruptedRecordings() {
+        let recovery = PendingRecordings.recoverInterrupted()
+        lostRecordings = recovery.lost
+        for info in recovery.recovered {
+            Journal.log(String(format: "recovered %@: %.1f s", info.sessionID.uuidString, info.duration))
+        }
+        for id in recovery.lost { Journal.log("nothing usable left of \(id)") }
+        if !recovery.recovered.isEmpty {
+            message = "Запись оборвалась, но сохранённая часть отправляется на iPhone."
+        }
+    }
+
+    // MARK: - Watching over a recording
+
+    private static let stalledMessage = "Микрофон не пишет. iPhone подставит свой звук за это время."
+
+    private func watchOverRecording() {
+        let now = HostClock.now()
+
+        // Everything needed to use the file if the app dies. The first one comes right after the first sample.
+        if lastCheckpoint == 0 || now - lastCheckpoint >= 5, let id = sessionID, let progress = recorder.progress {
+            PendingRecordings.saveCheckpoint(makeInfo(id, from: progress))
+            lastCheckpoint = now
+        }
+
+        let quiet = recorder.secondsSinceLastBuffer ?? 0
+        let capturing = quiet < AudioRecorder.stallTime
+        if capturing != isCapturing {
+            isCapturing = capturing
+            Journal.log(capturing ? "microphone delivering again" : "microphone stopped delivering")
+            publishStatusIfOffScreen()
+            if !capturing {
+                message = Self.stalledMessage
+            } else if message == Self.stalledMessage {
+                message = nil
+            }
+        }
+        if !capturing, isAppActive, now - lastRestartAttempt >= 2 {
+            lastRestartAttempt = now
+            recorder.restartIfStalled()
+        }
+
+        // A hole between these lines means the app wasn't running.
+        if now - lastDiaryLine >= 5 {
+            lastDiaryLine = now
+            publishStatusIfOffScreen()
+            let state = WKApplication.shared().applicationState.rawValue
+            let locked = Journal.isLocked.map(String.init) ?? "unknown"
+            let seconds = recorder.progress?.duration ?? 0
+            Journal.log(String(format: "alive: state %d, locked %@, recorded %.1f s, quiet %.1f s, engine %@, keep-alive %@, reachable %@, level %.0f dB",
+                               state, locked, seconds, quiet, recorder.isEngineRunning ? "on" : "off",
+                               keepAlive.isRunning ? "on" : "off", isPhoneReachable ? "yes" : "no", levelDB))
+        }
     }
 
     // MARK: - Heartbeat (status + NTP ping)
@@ -319,6 +439,7 @@ final class WatchModel {
     private func tick() {
         tickCount += 1
         if tickCount % 5 == 0 { updateTransfers() }
+        if phase != .idle { watchOverRecording() }
 
         let now = HostClock.now()
         let interval: Double
@@ -342,16 +463,7 @@ final class WatchModel {
         let t1 = HostClock.now()
         lastHeartbeat = t1
         heartbeatInFlight = true
-        let status = WatchStatus(
-            isAppActive: isAppActive,
-            isRecording: phase != .idle,
-            sessionID: sessionID,
-            recordingStartedAt: recordingStartedAt,
-            levelDB: phase == .idle ? nil : levelDB,
-            pendingTransfers: pendingTransfers,
-            transferProgress: transferProgress,
-            wantsPreview: isAppActive && isPreviewVisible
-        )
+        let status = currentStatus()
         let recordingSession = sessionID
         link.send(.heartbeat(status, sentAt: t1), timeout: 3) { [weak self] reply, t4 in
             guard let self else { return }
@@ -370,11 +482,33 @@ final class WatchModel {
                 let phoneLostTake = self.phase == .recording && !phone.isRecording && phone.sessionID != recordingSession
                 self.phoneMismatchCount = phoneLostTake ? self.phoneMismatchCount + 1 : 0
                 // Stop requested on the phone while our live channel was down.
-                if phone.stoppedSessionIDs.contains(recordingSession) || self.phoneMismatchCount >= 3 {
-                    self.finishRecording()
+                if phone.stoppedSessionIDs.contains(recordingSession) {
+                    self.finishRecording(because: "stop in the phone's status")
+                } else if self.phoneMismatchCount >= 3 {
+                    self.finishRecording(because: "the phone isn't filming this take")
                 }
             }
         }
+    }
+
+    private func currentStatus() -> WatchStatus {
+        WatchStatus(
+            isAppActive: isAppActive,
+            isRecording: phase != .idle,
+            sessionID: sessionID,
+            recordingStartedAt: recordingStartedAt,
+            levelDB: phase == .idle ? nil : levelDB,
+            pendingTransfers: pendingTransfers,
+            transferProgress: transferProgress,
+            wantsPreview: isAppActive && isPreviewVisible,
+            isCapturing: phase == .idle ? nil : isCapturing
+        )
+    }
+
+    /// Off screen, heartbeats can't reach the phone: tell it how things are through the slower channel.
+    private func publishStatusIfOffScreen() {
+        guard !isAppActive else { return }
+        link.publishStatus(currentStatus())
     }
 
     // MARK: - Transfers
@@ -386,6 +520,8 @@ final class WatchModel {
     }
 
     private func transferFinished(_ id: UUID, error: Error?) {
+        Journal.log("transfer of \(id) finished, error \(error?.localizedDescription ?? "none")")
+        defer { publishStatusIfOffScreen() }
         if error == nil {
             PendingRecordings.remove(id)
         } else {
@@ -401,9 +537,12 @@ final class WatchModel {
         let queued = Set(link.outstandingTransfers.compactMap {
             WCCoding.decode(WatchRecordingInfo.self, from: $0.file.metadata)?.sessionID
         })
-        for info in PendingRecordings.all() where !queued.contains(info.sessionID) && info.sessionID != sessionID {
+        for info in PendingRecordings.all()
+        where !queued.contains(info.sessionID) && info.sessionID != sessionID && !compressing.contains(info.sessionID) {
             link.transfer(info, from: PendingRecordings.audioURL(for: info.sessionID))
         }
+        for id in lostRecordings { link.sendQueued(.recordingLost(sessionID: id)) }
+        lostRecordings = []
         updateTransfers()
     }
 

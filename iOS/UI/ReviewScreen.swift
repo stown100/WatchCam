@@ -265,8 +265,19 @@ private struct StatusCard: View {
                 Text("Звук часов: \(info.format == .aac ? "AAC" : "PCM 16 бит"), \(Int(info.sampleRate)) Гц (микрофон: \(Int(info.hardwareSampleRate)) Гц)")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                if info.silenceInserted > 0.05 {
+                if let filled = session.filledAudioSeconds {
+                    Label("Часы записали не всё: \(Duration.seconds(filled).formatted(.time(pattern: .minuteSecond))) взято со звука iPhone",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                } else if info.silenceInserted > 0.05 {
                     Label(String(format: "Запись на часах прерывалась: вставлено %.1f с тишины", info.silenceInserted),
+                          systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+                if info.wasInterrupted == true {
+                    Label("Приложение на часах завершилось во время записи. Сохранённая часть восстановлена.",
                           systemImage: "exclamationmark.triangle")
                         .font(.footnote)
                         .foregroundStyle(.orange)
@@ -293,7 +304,7 @@ private struct StatusCard: View {
             if let transferProgress {
                 Text("Часы передают звук: \(Int(transferProgress * 100))%")
             } else {
-                Text("Ждём файл с часов. Он придёт сам, когда часы будут рядом с iPhone, даже если закрыть приложение.")
+                Text("Ждём файл с часов. Пока часы заблокированы или WatchCam на них не на экране, watchOS может не отправлять его. Откройте WatchCam на часах: файл обычно приходит в течение минуты. Если запись на часах оборвалась, приложение восстановит и отправит её при запуске.")
             }
         } else if let sync = session.sync {
             switch sync.method {

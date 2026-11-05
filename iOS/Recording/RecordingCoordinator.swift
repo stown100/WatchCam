@@ -45,6 +45,9 @@ final class RecordingCoordinator {
     private(set) var lastSessionID: UUID?
     private(set) var watchStatus: WatchStatus?
     private(set) var lastWatchContact: Date?
+    /// What the watch said last while its app was off screen. Arrives every few seconds at best.
+    private(set) var backgroundWatchStatus: WatchStatus?
+    private(set) var lastBackgroundContact: Date?
     /// Ticks every second so time-based state (watch freshness) re-evaluates.
     private(set) var now = Date()
     private(set) var thermalWarning: String?
@@ -75,6 +78,11 @@ final class RecordingCoordinator {
             self?.camera.setZoom(zoom, animated: true, rate: 4)
         }
         link.onAudioFile = { [weak self] info, url in self?.receiveAudio(info, at: url) }
+        link.onRecordingLost = { [weak self] id in self?.watchLostRecording(id) }
+        link.onBackgroundWatchStatus = { [weak self] status in
+            self?.backgroundWatchStatus = status
+            self?.lastBackgroundContact = Date()
+        }
         link.onStateChange = { [weak self] in
             self?.linkRevision += 1
             self?.pushContext()
@@ -130,9 +138,39 @@ final class RecordingCoordinator {
         return watchStatus?.levelDB
     }
 
+    struct WatchNote: Equatable {
+        enum Kind { case fine, unknown, problem }
+        var text: String
+        var kind: Kind
+    }
+
+    /// What to say about the watch's sound while filming, when the live status doesn't cover it.
+    var watchRecordingNote: WatchNote? {
+        guard phase == .recording, recordingUsesWatch else { return nil }
+        let silent = WatchNote(text: "Часы не пишут звук", kind: .problem)
+        if watchState == .recording {
+            return watchStatus?.isCapturing == false ? silent : nil
+        }
+        // Its app off screen, the watch can't answer heartbeats, but it sends a short status every few seconds.
+        if let status = backgroundWatchStatus, let contact = lastBackgroundContact,
+           now.timeIntervalSince(contact) < 15, status.sessionID == currentSessionID {
+            return status.isCapturing == false ? silent : WatchNote(text: "Пишут в фоне", kind: .fine)
+        }
+        // Not a sign of trouble by itself: the watch records on its own and sends the file afterwards.
+        return WatchNote(text: "Часы в фоне", kind: .unknown)
+    }
+
+    /// The freshest thing the watch said, through either channel.
+    private var latestWatchStatus: WatchStatus? {
+        if let lastBackgroundContact, lastBackgroundContact > (lastWatchContact ?? .distantPast) {
+            return backgroundWatchStatus
+        }
+        return watchStatus
+    }
+
     var watchTransferProgress: Double? {
-        guard let watchStatus, watchStatus.pendingTransfers > 0 else { return nil }
-        return watchStatus.transferProgress
+        guard let status = latestWatchStatus, status.pendingTransfers > 0 else { return nil }
+        return status.transferProgress
     }
 
     // MARK: - Lifecycle
@@ -190,7 +228,7 @@ final class RecordingCoordinator {
                             offersPhoneOnly: true)
             return
         case .unreachable:
-            prompt = Prompt(title: "Часы недоступны", message: FailureReason.unreachable.message, offersPhoneOnly: true)
+            prompt = Prompt(title: "Нет связи с часами", message: FailureReason.unreachable.message, offersPhoneOnly: true)
             return
         case .ready, .appNotActive, .recording:
             break
@@ -352,6 +390,19 @@ final class RecordingCoordinator {
             if $0.status == .waitingForWatch { $0.status = .processing }
         }
         processor.processIfReady(info.sessionID)
+    }
+
+    /// Nothing will ever come from the watch for this take: don't keep waiting for it.
+    private func watchLostRecording(_ id: UUID) {
+        guard let session = store.session(id), session.usesWatch, !session.hasWatchAudio else { return }
+        logger.warning("The watch has no audio for \(id, privacy: .public)")
+        if session.status == .recording {
+            // Still filming: the status settles when the video finishes.
+            store.update(id) { $0.usesWatch = false }
+            if currentSessionID == id { recordingUsesWatch = false }
+        } else {
+            processor.useIPhoneAudioOnly(id)
+        }
     }
 
     private func publishPhoneStatus() {

@@ -78,6 +78,8 @@ targets:
         WKRunsIndependentlyOfCompanionApp: false
         UIBackgroundModes:
           - audio
+        WKBackgroundModes:
+          - physical-therapy
         NSMicrophoneUsageDescription: "Микрофон часов записывает ваш голос для видео, которое снимает iPhone."
     settings:
       base:

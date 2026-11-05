@@ -1,6 +1,7 @@
 import Foundation
 
-/// Audio container/codec the watch records into.
+/// Audio format the watch sends its recording in. While recording it always writes PCM,
+/// because that stays readable if the app dies. AAC is made after a clean stop.
 enum WatchAudioFormat: String, Codable, CaseIterable, Identifiable {
     /// AAC in CAF, variable bit rate at maximum quality. Small files, fast transfer.
     case aac
@@ -45,6 +46,8 @@ struct WatchStatus: Codable, Equatable {
     var transferProgress: Double?
     /// The watch is on screen and would like small preview frames.
     var wantsPreview: Bool
+    /// While recording: whether the microphone is really delivering sound.
+    var isCapturing: Bool?
 }
 
 /// What the phone reports back to the watch.
@@ -88,7 +91,7 @@ enum FailureReason: String, Codable, Error {
         case .phoneAppNotActive: "Откройте WatchCam на iPhone: камера работает, только когда приложение на экране."
         case .cameraNotReady: "Камера iPhone ещё не готова."
         case .phoneBusy: "iPhone уже записывает."
-        case .unreachable: "Нет связи. Проверьте, что iPhone рядом и Bluetooth включён."
+        case .unreachable: "Откройте WatchCam на часах: связь с iPhone есть, только пока приложение на экране. Если не помогает, проверьте, что iPhone рядом и Bluetooth включён."
         }
     }
 }
@@ -106,6 +109,8 @@ enum WCMessage: Codable {
     case heartbeat(WatchStatus, sentAt: Double)
     /// Digital Crown zoom, in "Camera app" units.
     case setZoom(Double)
+    /// The watch has nothing to send for this take: the phone shouldn't wait for it.
+    case recordingLost(sessionID: UUID)
 }
 
 enum WCReply: Codable {
@@ -113,6 +118,13 @@ enum WCReply: Codable {
     case failed(FailureReason)
     /// Heartbeat answer carrying the phone's t2/t3.
     case phoneStatus(PhoneStatus, receivedAt: Double, sentAt: Double)
+}
+
+/// A stretch of a recording's file that holds inserted silence instead of sound.
+struct AudioGap: Codable, Equatable {
+    /// Seconds from the start of the file.
+    var start: Double
+    var duration: Double
 }
 
 /// Metadata attached to the audio file the watch transfers.
@@ -132,6 +144,10 @@ struct WatchRecordingInfo: Codable, Equatable {
     var silenceInserted: Double
     /// Best NTP round trips taken while recording.
     var clockSamples: [ClockSample]
+    /// Where that silence is.
+    var gaps: [AudioGap]?
+    /// The app died during the recording, and this is what was saved up to that point.
+    var wasInterrupted: Bool?
 }
 
 /// Wraps Codable values into WatchConnectivity property-list payloads.

@@ -56,6 +56,13 @@ final class WatchLink: NSObject, WCSessionDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { once.fire((nil, HostClock.now())) }
     }
 
+    /// Live messages only get through while the app is on screen. This works in the background too:
+    /// the system delivers the latest status whenever it can, earlier ones are dropped.
+    func publishStatus(_ status: WatchStatus) {
+        guard session.activationState == .activated else { return }
+        try? session.updateApplicationContext(WCCoding.dictionary(status))
+    }
+
     /// Queued delivery that survives disconnection; used when a live message fails.
     func sendQueued(_ message: WCMessage) {
         guard session.activationState == .activated else { return }

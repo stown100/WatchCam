@@ -97,9 +97,15 @@ final class SessionProcessor {
         logger.info("Sync \(id, privacy: .public): coarse offset \(coarse ?? .nan, format: .fixed(precision: 4)) s")
         let entries = backgroundEntries
 
+        // Inserted silence can't be aligned with anything: analyze the longest stretch of real sound.
+        let soundSpan = session.watchInfo.flatMap { info -> ClosedRange<Double>? in
+            guard let gaps = info.gaps else { return nil }
+            return AudioCoverage.longestSoundSpan(audioDuration: info.duration, gaps: gaps.map { $0.start...($0.start + $0.duration) })
+        }
+
         let result: SyncResult
         do {
-            result = try await SyncEngine.synchronize(reference: videoURL, target: audioURL, coarseOffset: coarse)
+            result = try await SyncEngine.synchronize(reference: videoURL, target: audioURL, coarseOffset: coarse, soundSpan: soundSpan)
         } catch {
             // Typically: the video has no iPhone audio (microphone access denied).
             logger.error("Fine sync failed: \(error.localizedDescription, privacy: .public)")
@@ -117,13 +123,65 @@ final class SessionProcessor {
         }
 
         let corrected = await correctDriftIfNeeded(session, result: result, audioURL: audioURL)
+
+        var filled: FilledAudio?
+        var fillError: String?
+        do {
+            filled = try await fillMissingAudioIfNeeded(session, result: result, audioURL: audioURL, corrected: corrected)
+        } catch {
+            if backgroundEntries != entries {
+                logger.info("Filling was interrupted by leaving the app, will run again")
+                return false
+            }
+            logger.error("Filling missing audio failed: \(error.localizedDescription, privacy: .public)")
+            // The clip is then cut to the part the watch recorded. The full video stays in the record.
+            fillError = "Часы записали только часть, и дополнить звук не удалось: ролик будет короче видео."
+        }
+
         store.update(id) {
             $0.sync = result
             $0.coarseOffset = coarse
             $0.correctedAudioFileName = corrected
+            $0.filledAudioFileName = filled?.name
+            $0.filledAudioSeconds = filled?.seconds
+            $0.errorMessage = fillError
             $0.status = .ready
         }
         return true
+    }
+
+    private struct FilledAudio {
+        var name: String
+        var seconds: Double
+    }
+
+    /// The watch may have recorded only part of the take. The video stays whole, with the iPhone's
+    /// own sound where the watch has none.
+    private func fillMissingAudioIfNeeded(
+        _ session: RecordingSession,
+        result: SyncResult,
+        audioURL: URL,
+        corrected: String?
+    ) async throws -> FilledAudio? {
+        guard let info = session.watchInfo, let duration = session.videoDuration else { return nil }
+
+        // Drift correction stretches the file's timeline by 1/ratio.
+        let scale = corrected == nil ? 1 : result.ratio
+        let source = corrected.map { SessionStore.fileURL(for: session.id, name: $0) } ?? audioURL
+        let offset = result.offset / scale
+        let gaps = (info.gaps ?? []).map { ($0.start / scale)...(($0.start + $0.duration) / scale) }
+
+        let missing = AudioCoverage.missing(videoDuration: duration, audioDuration: info.duration / scale, gaps: gaps, offset: offset)
+        guard !missing.isEmpty else { return nil }
+
+        let seconds = missing.reduce(0) { $0 + $1.upperBound - $1.lowerBound }
+        logger.info("Watch audio covers only part of the take: \(seconds, format: .fixed(precision: 1)) s to fill from the iPhone")
+        let name = "watch-filled.caf"
+        try await AudioFileTools.fillMissing(
+            watch: source, offset: offset, missing: missing,
+            video: SessionStore.videoURL(for: session.id), videoDuration: duration,
+            output: SessionStore.fileURL(for: session.id, name: name))
+        return FilledAudio(name: name, seconds: seconds)
     }
 
     /// Long takes: the watch's audio clock runs slightly faster or slower than the iPhone's.
@@ -170,6 +228,11 @@ final class SessionProcessor {
     static func audioSource(for session: RecordingSession) -> MovieComposer.AudioSource? {
         guard session.usesWatch, let sync = session.sync else { return nil }
         // Positive manualOffset = audio plays later.
+        if let filled = session.filledAudioFileName {
+            // Already on the video's timeline. A manual shift moves the iPhone's parts along with the
+            // watch's, which is fine: it's small, and only needed when the sync itself was wrong.
+            return .init(url: SessionStore.fileURL(for: session.id, name: filled), offset: -session.manualOffset)
+        }
         if let corrected = session.correctedAudioFileName {
             // The corrected file is time-scaled by 1/ratio, so its timeline is target / ratio.
             return .init(url: SessionStore.fileURL(for: session.id, name: corrected),
@@ -306,7 +369,7 @@ final class SessionProcessor {
 
     func deleteSources(_ id: UUID) {
         guard let session = store.session(id) else { return }
-        let names = ["video.mov", session.watchAudioFileName, session.correctedAudioFileName].compactMap { $0 }
+        let names = ["video.mov", session.watchAudioFileName, session.correctedAudioFileName, session.filledAudioFileName].compactMap { $0 }
         for name in names {
             try? FileManager.default.removeItem(at: SessionStore.fileURL(for: id, name: name))
         }

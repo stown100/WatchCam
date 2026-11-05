@@ -14,6 +14,10 @@ final class PhoneLink: NSObject, WCSessionDelegate {
     var onZoomRequest: (@MainActor (Double) -> Void)?
     /// A watch recording arrived and was moved into the session folder.
     var onAudioFile: (@MainActor (WatchRecordingInfo, URL) -> Void)?
+    /// The watch has nothing to send for this take.
+    var onRecordingLost: (@MainActor (UUID) -> Void)?
+    /// Status the watch sends while its app is off screen, when heartbeats can't get through.
+    var onBackgroundWatchStatus: (@MainActor (WatchStatus) -> Void)?
     var onStateChange: (@MainActor () -> Void)?
 
     private let session = WCSession.default
@@ -190,15 +194,30 @@ final class PhoneLink: NSObject, WCSessionDelegate {
             respond(.ok)
             DispatchQueue.main.async { self.onZoomRequest?(zoom) }
 
+        case let .recordingLost(sessionID):
+            respond(.ok)
+            DispatchQueue.main.async { self.onRecordingLost?(sessionID) }
+
         case .startRecording, .stopRecording:
             respond(.ok)
         }
     }
 
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
-        guard let message = WCCoding.decode(WCMessage.self, from: userInfo),
-              case let .requestStop(sessionID) = message else { return }
-        DispatchQueue.main.async { self.onStopRequest?(sessionID) }
+        guard let message = WCCoding.decode(WCMessage.self, from: userInfo) else { return }
+        switch message {
+        case let .requestStop(sessionID):
+            DispatchQueue.main.async { self.onStopRequest?(sessionID) }
+        case let .recordingLost(sessionID):
+            DispatchQueue.main.async { self.onRecordingLost?(sessionID) }
+        default:
+            break
+        }
+    }
+
+    func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
+        guard let status = WCCoding.decode(WatchStatus.self, from: applicationContext) else { return }
+        DispatchQueue.main.async { self.onBackgroundWatchStatus?(status) }
     }
 
     func session(_ session: WCSession, didReceive file: WCSessionFile) {

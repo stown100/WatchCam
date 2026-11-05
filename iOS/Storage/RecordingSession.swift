@@ -46,6 +46,11 @@ struct RecordingSession: Codable, Identifiable, Equatable {
     var watchAudioFileName: String?
     /// Watch audio resampled to cancel clock drift, if the drift was large enough.
     var correctedAudioFileName: String?
+    /// The watch recorded only part of the take: a track for the whole video, using the iPhone's
+    /// own sound where the watch has none. Lines up with the video from its first frame.
+    var filledAudioFileName: String?
+    /// How much of the video that track takes from the iPhone, in seconds.
+    var filledAudioSeconds: Double?
 
     // Sync
     var sync: SyncResult?
