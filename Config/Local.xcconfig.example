@@ -1,0 +1,5 @@
+// Copy this file to Config/Local.xcconfig and set your values.
+// Team ID: Xcode → Settings → Accounts → your Apple ID → "Personal Team" (10 characters).
+
+DEVELOPMENT_TEAM = ABCDE12345
+BUNDLE_ID_PREFIX = com.yourname

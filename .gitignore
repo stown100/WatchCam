@@ -1,0 +1,30 @@
+# Xcode
+DerivedData/
+*.xcodeproj/
+!project.yml
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.playground
+
+# Personal signing settings
+Config/Local.xcconfig
+
+# Build
+build/
+.build/
+
+# macOS
+.DS_Store
+*.swp
+
+# SwiftPM
+.swiftpm/
+Packages/
+Package.resolved

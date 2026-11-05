@@ -1,0 +1,8 @@
+// Shared build settings for all targets.
+// Personal values (Team ID, bundle prefix) live in Local.xcconfig, which is not committed.
+// Copy Local.xcconfig.example to Local.xcconfig and fill it in.
+
+BUNDLE_ID_PREFIX = com.serhiiborodulin
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
