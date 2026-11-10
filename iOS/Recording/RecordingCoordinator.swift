@@ -61,8 +61,16 @@ final class RecordingCoordinator {
     @ObservationIgnored private var scenePhase: ScenePhase = .background
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var thermalObserver: NSObjectProtocol?
+    /// Since when the watch has been showing its preview page.
+    @ObservationIgnored private var previewWantedSince: Date?
+    @ObservationIgnored private var previewSlowed = false
+    @ObservationIgnored private var previewTrouble: PreviewTrouble?
+    @ObservationIgnored private var lastPreviewRepair = Date.distantPast
 
     init() {
+        // iOS may start the app in advance ("prewarming") and leave it waiting for days.
+        let prewarmed = ProcessInfo.processInfo.environment["ActivePrewarm"] == "1"
+        Journal.log("app launched\(prewarmed ? " in advance by iOS (prewarming)" : "")")
         settings = AppSettings()
         store = SessionStore()
         processor = SessionProcessor(store: store, settings: settings)
@@ -108,7 +116,9 @@ final class RecordingCoordinator {
         // The watch went quiet (wrist down, app closed): stop making preview frames.
         if let lastWatchContact, now.timeIntervalSince(lastWatchContact) > 3 {
             camera.setPreviewWanted(false)
+            notePreviewWanted(false)
         }
+        watchOverPreview()
         publishPhoneStatus()
     }
 
@@ -176,9 +186,11 @@ final class RecordingCoordinator {
     // MARK: - Lifecycle
 
     func scenePhaseChanged(_ newPhase: ScenePhase) {
+        if newPhase != scenePhase { Journal.log("app \(newPhase)") }
         scenePhase = newPhase
         switch newPhase {
         case .active:
+            link.activateIfNeeded()
             camera.configure(with: settings.values.capture)
             camera.startRunning()
             // The phone sits on a tripod: the screen must not lock, or the camera stops.
@@ -291,6 +303,7 @@ final class RecordingCoordinator {
         recordingUsesWatch = usesWatch
         recordingStartedAt = Date()
         phase = .recording
+        Journal.log("take \(id) started, \(usesWatch ? "with" : "without") the watch")
 
         camera.startRecording(
             to: SessionStore.videoURL(for: id),
@@ -311,6 +324,7 @@ final class RecordingCoordinator {
     private func videoFinished(_ id: UUID, error: Error?) {
         let wasStoppedByUser = phase == .stopping
         let usesWatch = recordingUsesWatch
+        Journal.log("take \(id) video finished\(wasStoppedByUser ? "" : " on its own"), error \(error?.localizedDescription ?? "none")")
         resetToIdle()
         // Interrupted by a call, backgrounding, a full disk…: make sure the watch stops too.
         if !wasStoppedByUser, usesWatch { tellWatchToStop(id) }
@@ -374,7 +388,85 @@ final class RecordingCoordinator {
     private func receive(_ status: WatchStatus) {
         watchStatus = status
         lastWatchContact = Date()
-        camera.setPreviewWanted(status.wantsPreview && scenePhase != .background)
+        let wanted = status.wantsPreview && scenePhase != .background
+        // A file coming from the watch shares the link with the frames. Live messages go first,
+        // so a full-speed preview would starve the file: one frame a second leaves it most of the link.
+        let slowed = status.pendingTransfers > 0 && !status.isRecording
+        camera.setPreviewWanted(wanted, interval: slowed ? CameraController.previewIntervalDuringTransfer : CameraController.previewInterval)
+        notePreviewWanted(wanted)
+        if wanted, slowed != previewSlowed {
+            previewSlowed = slowed
+            Journal.log(slowed ? "watch preview slowed down while the watch sends a file" : "watch preview back to full speed")
+        }
+    }
+
+    // MARK: - Watch preview health
+
+    /// Which step of the watch preview stopped working.
+    private enum PreviewTrouble: Equatable {
+        case noCameraFrames
+        case linkNotFree(reachable: Bool)
+        case encoding
+        case delivery(String)
+
+        var description: String {
+            switch self {
+            case .noCameraFrames: "the camera gives no preview frames"
+            case .linkNotFree(let reachable): "the link to the watch is never free (reachable \(reachable))"
+            case .encoding: "frames don't turn into JPEG"
+            case .delivery(let error): "frames don't reach the watch: \(error)"
+            }
+        }
+    }
+
+    private func notePreviewWanted(_ wanted: Bool) {
+        guard wanted != (previewWantedSince != nil) else { return }
+        previewWantedSince = wanted ? Date() : nil
+        Journal.log("watch preview \(wanted ? "wanted" : "not wanted")")
+    }
+
+    /// Every step of the preview is set up once per launch, and iOS may start the app in the background
+    /// long before it's opened, so a step can go bad unnoticed. This finds the step that stopped,
+    /// writes it down once and tries the matching repair.
+    private func watchOverPreview() {
+        guard let since = previewWantedSince, now.timeIntervalSince(since) > 3,
+              scenePhase == .active, camera.isRunning else {
+            previewTrouble = nil
+            return
+        }
+        let clock = HostClock.now()
+        let steps = camera.previewProgress
+        let delivery = link.previewDelivery
+        let trouble: PreviewTrouble?
+        if clock - delivery.lastDelivered < 3 {
+            trouble = nil
+        } else if clock - steps.frame > 2 {
+            trouble = .noCameraFrames
+        } else if clock - steps.attempt > 3 {
+            trouble = .linkNotFree(reachable: link.isReachable)
+        } else if clock - steps.encoded > 3 {
+            trouble = .encoding
+        } else {
+            trouble = .delivery(delivery.lastError ?? "no answer")
+        }
+        if trouble != previewTrouble {
+            Journal.log(trouble.map { "watch preview stuck: \($0.description)" } ?? "watch preview: frames reach the watch")
+            previewTrouble = trouble
+        }
+
+        // Encoding repairs itself (a new Core Image context); the other steps get a nudge now and then.
+        guard let trouble, now.timeIntervalSince(lastPreviewRepair) > 10 else { return }
+        switch trouble {
+        case .noCameraFrames:
+            guard phase == .idle else { return }
+            lastPreviewRepair = now
+            camera.reattachPreviewOutput()
+        case .linkNotFree, .delivery:
+            lastPreviewRepair = now
+            link.activateIfNeeded()
+        case .encoding:
+            break
+        }
     }
 
     private func receiveAudio(_ info: WatchRecordingInfo, at url: URL) {

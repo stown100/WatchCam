@@ -35,6 +35,9 @@ final class WatchModel {
     /// Latest small frame from the iPhone camera.
     private(set) var previewImage: UIImage?
     private(set) var previewReceivedAt: Date?
+    /// The last frame is recent. Checked on a timer: with no new frames the view itself wouldn't
+    /// notice, and an old frame would stay on screen as if it were live.
+    private(set) var isPreviewFresh = false
     /// The preview page is on screen: ask the phone for frames.
     var isPreviewVisible = false {
         didSet {
@@ -75,6 +78,11 @@ final class WatchModel {
     @ObservationIgnored private var lastCheckpoint: Double = 0
     @ObservationIgnored private var lastDiaryLine: Double = 0
     @ObservationIgnored private var lastRestartAttempt: Double = 0
+    /// Since when the preview page has been waiting for frames from a ready iPhone.
+    @ObservationIgnored private var previewWaitingSince: Date?
+    @ObservationIgnored private var previewWaitLogged = false
+    /// When each transfer was queued and how big the file was, to write down the speed.
+    @ObservationIgnored private var transferStarts: [UUID: (date: Date, bytes: Int, previewOpen: Bool)] = [:]
     @ObservationIgnored private var sessionID: UUID?
     @ObservationIgnored private var clockSamples: [ClockSample] = []
     @ObservationIgnored private var timer: Timer?
@@ -350,9 +358,13 @@ final class WatchModel {
     }
 
     private func send(_ info: WatchRecordingInfo) {
-        link.transfer(info, from: PendingRecordings.audioURL(for: info.sessionID))
+        let url = PendingRecordings.audioURL(for: info.sessionID)
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let previewOpen = isAppActive && isPreviewVisible
+        transferStarts[info.sessionID] = (Date(), bytes, previewOpen)
+        link.transfer(info, from: url)
         updateTransfers()
-        Journal.log("transfer of \(info.sessionID) queued, locked \(Journal.isLocked.map(String.init) ?? "unknown")")
+        Journal.log("transfer of \(info.sessionID) queued: \(info.format.rawValue), \(bytes / 1024) KB, locked \(Journal.isLocked.map(String.init) ?? "unknown"), preview page \(previewOpen ? "open" : "closed")")
         publishStatusIfOffScreen()
         stopKeepAliveIfDone()
     }
@@ -434,11 +446,34 @@ final class WatchModel {
         }
     }
 
+    // MARK: - Preview
+
+    private func updatePreviewFreshness() {
+        let fresh = previewReceivedAt.map { Date().timeIntervalSince($0) < 3 } ?? false
+        if fresh != isPreviewFresh { isPreviewFresh = fresh }
+
+        // Written down when the page waits in vain, so a broken preview leaves a trace.
+        let waiting = isAppActive && isPreviewVisible && !fresh && (phoneState == .ready || phoneState == .recording)
+        if !waiting {
+            if previewWaitLogged, fresh { Journal.log("preview frames arriving") }
+            previewWaitingSince = nil
+            previewWaitLogged = false
+        } else if let since = previewWaitingSince {
+            if !previewWaitLogged, Date().timeIntervalSince(since) > 5 {
+                previewWaitLogged = true
+                Journal.log("preview page open, no frames from the iPhone for 5 s (iPhone \(phoneState), reachable \(isPhoneReachable))")
+            }
+        } else {
+            previewWaitingSince = Date()
+        }
+    }
+
     // MARK: - Heartbeat (status + NTP ping)
 
     private func tick() {
         tickCount += 1
         if tickCount % 5 == 0 { updateTransfers() }
+        updatePreviewFreshness()
         if phase != .idle { watchOverRecording() }
 
         let now = HostClock.now()
@@ -520,7 +555,13 @@ final class WatchModel {
     }
 
     private func transferFinished(_ id: UUID, error: Error?) {
-        Journal.log("transfer of \(id) finished, error \(error?.localizedDescription ?? "none")")
+        var speed = ""
+        if let start = transferStarts.removeValue(forKey: id) {
+            let seconds = Date().timeIntervalSince(start.date)
+            speed = String(format: " after %.0f s (%.0f KB/s from queuing; preview page was %@ at the start)",
+                           seconds, Double(start.bytes) / 1024 / max(seconds, 0.1), start.previewOpen ? "open" : "closed")
+        }
+        Journal.log("transfer of \(id) finished\(speed), error \(error?.localizedDescription ?? "none")")
         defer { publishStatusIfOffScreen() }
         if error == nil {
             PendingRecordings.remove(id)

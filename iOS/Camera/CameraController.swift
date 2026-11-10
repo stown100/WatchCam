@@ -55,13 +55,18 @@ final class CameraController: NSObject {
     @ObservationIgnored var canSendPreviewFrame: (() -> Bool)?
     @ObservationIgnored private let previewOutput = AVCaptureVideoDataOutput()
     @ObservationIgnored private let previewQueue = DispatchQueue(label: "WatchCam.preview")
-    @ObservationIgnored private let previewContext = CIContext()
     @ObservationIgnored private let previewLock = NSLock()
     // Guarded by `previewLock`.
     @ObservationIgnored private var previewWanted = false
+    @ObservationIgnored private var previewInterval = CameraController.previewInterval
     @ObservationIgnored private var previewRotationAngle: CGFloat = 90
+    @ObservationIgnored private var previewSteps = PreviewSteps()
     // Preview queue only.
     @ObservationIgnored private var lastPreviewTime: Double = 0
+    /// Made with the first frame, not at launch: iOS may start the app in the background
+    /// long before it is opened, and a context made then is never checked again.
+    @ObservationIgnored private var previewContext: CIContext?
+    @ObservationIgnored private var previewEncodeFailures = 0
 
     // Session-queue state.
     @ObservationIgnored private var videoInput: AVCaptureDeviceInput?
@@ -113,6 +118,7 @@ final class CameraController: NSObject {
             guard isConfigured, !session.isRunning else { return }
             session.startRunning()
             let running = session.isRunning
+            if !running { Journal.log("camera didn't start") }
             DispatchQueue.main.async { self.isRunning = running }
         }
     }
@@ -205,6 +211,7 @@ final class CameraController: NSObject {
         isConfigured = true
         session.startRunning()
         let running = session.isRunning
+        Journal.log("camera set up, running \(running), watch preview output \(session.outputs.contains(previewOutput) ? "on" : "off")")
         publishDeviceState(device)
         DispatchQueue.main.async {
             self.status = .ready
@@ -238,17 +245,54 @@ final class CameraController: NSObject {
     /// camera's bandwidth. If the session goes over budget (e.g. 4K60 HDR), the recording wins.
     private func enforceHardwareBudget() {
         guard session.outputs.contains(previewOutput), session.hardwareCost > 1 else { return }
-        logger.warning("Hardware cost \(self.session.hardwareCost) > 1: watch preview off for this format")
+        Journal.log("hardware cost \(session.hardwareCost) > 1: watch preview off for this format")
         session.beginConfiguration()
         session.removeOutput(previewOutput)
         session.commitConfiguration()
     }
 
+    /// Upper limit for the watch preview: about 8 frames per second.
+    static let previewInterval = 0.125
+    /// While a file from the watch is on its way: the frames share the link with it.
+    static let previewIntervalDuringTransfer = 1.0
+
     /// Any thread. Frames are produced only while the watch app is on screen.
-    func setPreviewWanted(_ wanted: Bool) {
+    func setPreviewWanted(_ wanted: Bool, interval: Double = CameraController.previewInterval) {
         previewLock.lock()
         previewWanted = wanted
+        previewInterval = interval
         previewLock.unlock()
+    }
+
+    /// When each step of the watch preview last worked, in host-clock seconds.
+    /// Shows which step stopped when the watch gets no picture.
+    struct PreviewSteps {
+        /// The camera delivered a preview-sized frame.
+        var frame: Double = 0
+        /// A frame was due and the link was free, so encoding began.
+        var attempt: Double = 0
+        /// The frame became a JPEG and went to the link.
+        var encoded: Double = 0
+    }
+
+    var previewProgress: PreviewSteps {
+        previewLock.lock()
+        defer { previewLock.unlock() }
+        return previewSteps
+    }
+
+    /// Takes the preview output out of the session and puts it back, for when the camera stopped
+    /// delivering its frames. Not while recording: changing the session could disturb the movie.
+    func reattachPreviewOutput() {
+        sessionQueue.async { [self] in
+            guard isConfigured, !movieOutput.isRecording else { return }
+            session.beginConfiguration()
+            if session.outputs.contains(previewOutput) { session.removeOutput(previewOutput) }
+            updatePreviewOutput()
+            session.commitConfiguration()
+            enforceHardwareBudget()
+            Journal.log("watch preview output re-attached: \(session.outputs.contains(previewOutput) ? "on" : "off")")
+        }
     }
 
     // MARK: - Device & format
@@ -621,12 +665,14 @@ final class CameraController: NSObject {
         ) { [weak self] notification in
             let raw = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
             let reason = raw.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+            Journal.log("camera interrupted, reason \(raw.map(String.init) ?? "none")")
             self?.interruptionMessage = Self.describe(reason)
             self?.isRunning = false
         })
         notificationObservers.append(center.addObserver(
             forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main
         ) { [weak self] _ in
+            Journal.log("camera interruption ended")
             self?.interruptionMessage = nil
             self?.isRunning = true
         })
@@ -635,7 +681,7 @@ final class CameraController: NSObject {
         ) { [weak self] notification in
             guard let self else { return }
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError
-            logger.error("Capture runtime error: \(error?.localizedDescription ?? "unknown", privacy: .public)")
+            Journal.log("camera runtime error: \(error?.localizedDescription ?? "unknown") (\(error?.code.rawValue ?? 0))")
             // Media services were reset: the session must be restarted.
             if error?.code == .mediaServicesWereReset { startRunning() }
         })
@@ -657,32 +703,51 @@ final class CameraController: NSObject {
 extension CameraController: @unchecked Sendable {}
 
 extension CameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
-    /// Upper limit for the watch preview: about 8 frames per second.
-    private static let minPreviewInterval = 0.125
-
     /// Preview queue. Turns the newest frame into a small JPEG as soon as the link to the watch is free,
     /// so the picture updates as fast as the connection allows and frames never wait in a queue.
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let now = HostClock.now()
         previewLock.lock()
         let wanted = previewWanted
+        let interval = previewInterval
         let angle = previewRotationAngle
+        previewSteps.frame = now
         previewLock.unlock()
 
-        let now = HostClock.now()
-        guard wanted, now - lastPreviewTime >= Self.minPreviewInterval, canSendPreviewFrame?() == true,
+        guard wanted, now - lastPreviewTime >= interval, canSendPreviewFrame?() == true,
               let sink = onPreviewFrame, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastPreviewTime = now
+        markPreviewStep(\.attempt, at: now)
 
         // Buffers come in sensor orientation; turn them the way the movie will play.
         var image = CIImage(cvPixelBuffer: pixelBuffer).oriented(Self.orientation(forRotationAngle: angle))
         let scale = 220 / max(image.extent.width, image.extent.height)
         image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = previewContext ?? CIContext()
+        previewContext = context
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let jpeg = previewContext.jpegRepresentation(
+              let jpeg = context.jpegRepresentation(
                   of: image, colorSpace: colorSpace,
                   options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.5]
-              ) else { return }
+              ) else {
+            // A context that keeps failing is dropped: the next frame makes a new one.
+            previewEncodeFailures += 1
+            if previewEncodeFailures >= 5 {
+                previewEncodeFailures = 0
+                previewContext = nil
+                Journal.log("watch preview: JPEG encoding keeps failing, making a new Core Image context")
+            }
+            return
+        }
+        previewEncodeFailures = 0
+        markPreviewStep(\.encoded, at: now)
         sink(jpeg)
+    }
+
+    private func markPreviewStep(_ step: WritableKeyPath<PreviewSteps, Double>, at time: Double) {
+        previewLock.lock()
+        previewSteps[keyPath: step] = time
+        previewLock.unlock()
     }
 
     private static func orientation(forRotationAngle angle: CGFloat) -> CGImagePropertyOrientation {

@@ -95,7 +95,7 @@ private struct PreviewPage: View {
 
     var body: some View {
         ZStack {
-            if !isLuminanceReduced, let image = model.previewImage, isFresh {
+            if !isLuminanceReduced, let image = model.previewImage, model.isPreviewFresh {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
@@ -127,11 +127,6 @@ private struct PreviewPage: View {
             }
         }
         .padding(.horizontal, 4)
-    }
-
-    private var isFresh: Bool {
-        guard let received = model.previewReceivedAt else { return false }
-        return Date().timeIntervalSince(received) < 3
     }
 
     private var placeholderText: String {

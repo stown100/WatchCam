@@ -28,6 +28,10 @@ final class PhoneLink: NSObject, WCSessionDelegate {
     /// When the preview frame now on its way was sent; `nil` if the link is free.
     private var previewSentAt: Double?
     private var previewStats = PreviewStats()
+    /// Host time of the last heartbeat from the watch.
+    private var lastHeartbeatAt: Double = -.infinity
+    private var lastPreviewDelivered: Double = -.infinity
+    private var lastPreviewError: String?
 
     /// Preview link quality, logged every few seconds to tune frame size and rate on real devices.
     private struct PreviewStats {
@@ -44,10 +48,34 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         session.activate()
     }
 
+    /// For when the app comes back after a long time in the background.
+    func activateIfNeeded() {
+        guard WCSession.isSupported(), session.activationState != .activated else { return }
+        Journal.log("watch link not active (\(session.activationState.rawValue)): activating again")
+        activate()
+    }
+
     var isActivated: Bool { session.activationState == .activated }
     var isPaired: Bool { isActivated && session.isPaired }
     var isWatchAppInstalled: Bool { isActivated && session.isWatchAppInstalled }
     var isReachable: Bool { isActivated && session.isReachable }
+
+    /// Whether a live message has a chance. A heartbeat in the last two seconds proves the watch app
+    /// is on screen, even if `isReachable` hasn't caught up: it can lag after a long time in the background.
+    var canReachWatch: Bool {
+        guard isActivated else { return false }
+        lock.lock()
+        let heartbeat = lastHeartbeatAt
+        lock.unlock()
+        return session.isReachable || HostClock.now() - heartbeat < 2
+    }
+
+    /// When a preview frame last reached the watch (host time), and the last error, if any.
+    var previewDelivery: (lastDelivered: Double, lastError: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (lastPreviewDelivered, lastPreviewError)
+    }
 
     /// Snapshot used to answer heartbeats. Safe to call from any thread.
     func setPhoneStatus(_ status: PhoneStatus) {
@@ -61,7 +89,7 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         let once = OnceGuard<WCReply?> { value in
             DispatchQueue.main.async { reply(value) }
         }
-        guard isReachable else {
+        guard canReachWatch else {
             once.fire(nil)
             return
         }
@@ -82,7 +110,7 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         lock.unlock()
         // A reply can get lost: don't let that freeze the preview.
         if let sentAt, HostClock.now() - sentAt < 2 { return false }
-        return isReachable
+        return canReachWatch
     }
 
     /// Sends a preview frame as raw JPEG bytes. Check `canSendPreviewFrame` first.
@@ -92,25 +120,29 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         previewSentAt = sentAt
         lock.unlock()
         session.sendMessageData(jpeg, replyHandler: { [weak self] _ in
-            self?.previewFrameFinished(sentAt: sentAt, size: jpeg.count, delivered: true)
-        }, errorHandler: { [weak self] _ in
-            self?.previewFrameFinished(sentAt: sentAt, size: jpeg.count, delivered: false)
+            self?.previewFrameFinished(sentAt: sentAt, size: jpeg.count, error: nil)
+        }, errorHandler: { [weak self] error in
+            self?.previewFrameFinished(sentAt: sentAt, size: jpeg.count, error: error)
         })
     }
 
-    private func previewFrameFinished(sentAt: Double, size: Int, delivered: Bool) {
+    private func previewFrameFinished(sentAt: Double, size: Int, error: Error?) {
         let now = HostClock.now()
         lock.lock()
         // A late answer to an abandoned frame must not free the slot of a newer one.
         if previewSentAt == sentAt { previewSentAt = nil }
         // Preview was off for a while: start counting afresh.
         if now - previewStats.startedAt > 10 { previewStats = PreviewStats() }
-        if delivered {
+        if let error {
+            previewStats.failed += 1
+            let nsError = error as NSError
+            lastPreviewError = "\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)"
+        } else {
             previewStats.delivered += 1
             previewStats.bytes += size
             previewStats.roundTrip += now - sentAt
-        } else {
-            previewStats.failed += 1
+            lastPreviewDelivered = now
+            lastPreviewError = nil
         }
         var report: PreviewStats?
         if now - previewStats.startedAt >= 5 {
@@ -143,24 +175,28 @@ final class PhoneLink: NSObject, WCSessionDelegate {
     // MARK: - WCSessionDelegate
 
     func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
-        if let error { logger.error("Activation failed: \(error.localizedDescription, privacy: .public)") }
+        Journal.log("watch link activated: state \(activationState.rawValue), paired \(session.isPaired), app installed \(session.isWatchAppInstalled), reachable \(session.isReachable), error \(error?.localizedDescription ?? "none")")
         notifyStateChange()
     }
 
     func sessionDidBecomeInactive(_ session: WCSession) {
+        Journal.log("watch link inactive")
         notifyStateChange()
     }
 
     func sessionDidDeactivate(_ session: WCSession) {
         // The user switched to another watch: reactivate for the new one.
+        Journal.log("watch link deactivated: activating again")
         session.activate()
     }
 
     func sessionReachabilityDidChange(_ session: WCSession) {
+        Journal.log("watch reachable: \(session.isReachable)")
         notifyStateChange()
     }
 
     func sessionWatchStateDidChange(_ session: WCSession) {
+        Journal.log("watch state changed: paired \(session.isPaired), app installed \(session.isWatchAppInstalled)")
         notifyStateChange()
     }
 
@@ -176,6 +212,7 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         case let .heartbeat(status, _):
             lock.lock()
             let snapshot = phoneStatus
+            lastHeartbeatAt = receivedAt
             lock.unlock()
             respond(.phoneStatus(snapshot, receivedAt: receivedAt, sentAt: HostClock.now()))
             DispatchQueue.main.async { self.onWatchStatus?(status) }
@@ -231,9 +268,11 @@ final class PhoneLink: NSObject, WCSessionDelegate {
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: file.fileURL, to: destination)
         } catch {
-            logger.error("Moving watch audio failed: \(error.localizedDescription, privacy: .public)")
+            Journal.log("moving watch audio for \(info.sessionID) failed: \(error.localizedDescription)")
             return
         }
+        let size = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? Int) ?? 0
+        Journal.log(String(format: "watch audio for %@ arrived: %@, %.1f s, %d KB", info.sessionID.uuidString, info.format.rawValue, info.duration, size / 1024))
         logger.info("Watch audio for \(info.sessionID, privacy: .public): \(info.format.rawValue, privacy: .public), \(info.sampleRate) Hz (hardware \(info.hardwareSampleRate) Hz), \(info.duration, format: .fixed(precision: 1)) s, \(info.clockSamples.count) clock samples")
         DispatchQueue.main.async { self.onAudioFile?(info, destination) }
     }
