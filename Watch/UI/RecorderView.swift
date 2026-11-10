@@ -74,6 +74,8 @@ struct RecorderView: View {
                 .lineLimit(3)
                 .minimumScaleFactor(0.7)
                 .onTapGesture { model.dismissMessage() }
+        } else if let focus = model.phoneFocus {
+            FocusBadge(focus: focus, showsText: true) { model.resetPhoneFocus() }
         } else if model.pendingTransfers > 0 {
             VStack(spacing: 2) {
                 Text("Отправка на iPhone")
@@ -115,6 +117,9 @@ private struct PreviewPage: View {
                 HStack {
                     ElapsedTimeText(start: model.recordingStartedAt, size: 16)
                     Spacer()
+                    if let focus = model.phoneFocus {
+                        FocusBadge(focus: focus, showsText: false) { model.resetPhoneFocus() }
+                    }
                     ZoomBadge(zoom: model.phoneZoom)
                 }
                 Spacer()
@@ -181,6 +186,36 @@ private struct ZoomBadge: View {
             .padding(.vertical, 2)
             .background(.black.opacity(0.6), in: Capsule())
     }
+}
+
+/// The phone's focus was set by hand on its screen. Tapping the badge makes it automatic again.
+/// A lock is the one to worry about: nothing brings the focus back, whoever walks into the frame.
+private struct FocusBadge: View {
+    let focus: PhoneFocus
+    let showsText: Bool
+    let reset: () -> Void
+
+    var body: some View {
+        Button(action: reset) {
+            HStack(spacing: 3) {
+                Image(systemName: isLocked ? "lock.fill" : "scope")
+                if showsText {
+                    Text(isLocked ? "Фокус заблокирован · сбросить" : "Фокус в точке · сбросить")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                }
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(isLocked ? .black : .yellow)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(isLocked ? AnyShapeStyle(.yellow) : AnyShapeStyle(.black.opacity(0.6)), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isLocked ? "Фокус на iPhone заблокирован. Сбросить" : "Фокус на iPhone выставлен в точку. Сбросить")
+    }
+
+    private var isLocked: Bool { focus == .locked }
 }
 
 private struct ElapsedTimeText: View {

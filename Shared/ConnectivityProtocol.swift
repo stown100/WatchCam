@@ -64,6 +64,18 @@ struct PhoneStatus: Codable, Equatable {
     var maxZoom: Double
     /// Values the Digital Crown stops at (1×, 2×, 3×…).
     var zoomSteps: [Double]
+    /// Focus set by hand on the phone's screen; `nil` while it is automatic.
+    /// Optional, so a watch app and a phone app from different builds still understand each other.
+    var focus: PhoneFocus? = nil
+}
+
+/// Focus the user set by touching the phone's screen. The phone often stands with its screen
+/// turned away, so the watch is the only place to notice a touch that wasn't meant.
+enum PhoneFocus: String, Codable {
+    /// A tapped point: still automatic, but aimed there until the scene changes.
+    case point
+    /// Long press: focus and exposure stay where they are, whatever happens in the frame.
+    case locked
 }
 
 /// Settings the phone pushes to the watch through the application context.
@@ -109,6 +121,8 @@ enum WCMessage: Codable {
     case heartbeat(WatchStatus, sentAt: Double)
     /// Digital Crown zoom, in "Camera app" units.
     case setZoom(Double)
+    /// Drop a focus point or lock set on the phone's screen: back to automatic.
+    case resetFocus
     /// The watch has nothing to send for this take: the phone shouldn't wait for it.
     case recordingLost(sessionID: UUID)
 }

@@ -72,6 +72,13 @@ final class CameraController: NSObject {
     @ObservationIgnored private var videoInput: AVCaptureDeviceInput?
     @ObservationIgnored private var isConfigured = false
     @ObservationIgnored private var settings = CaptureSettings()
+    /// Lens position at the last journal line about focus, to log only real moves.
+    @ObservationIgnored private var journaledLensPosition: Float = -1
+    /// Waits for the lens to come to rest before a "focus moved" line is written.
+    @ObservationIgnored private var lensRestCheck: DispatchWorkItem?
+    /// Counts focus changes made by the user, so a lock still waiting for the exposure to settle
+    /// can tell that a newer tap or a reset has replaced it.
+    @ObservationIgnored private var focusChangeCount = 0
 
     // Main-thread state.
     @ObservationIgnored private var configureRequested = false
@@ -211,7 +218,9 @@ final class CameraController: NSObject {
         isConfigured = true
         session.startRunning()
         let running = session.isRunning
-        Journal.log("camera set up, running \(running), watch preview output \(session.outputs.contains(previewOutput) ? "on" : "off")")
+        let standIns = device.fallbackPrimaryConstituentDevices.map(Self.lensName).joined(separator: ", ")
+        Journal.log("camera set up, running \(running), watch preview output \(session.outputs.contains(previewOutput) ? "on" : "off")"
+            + ", lenses that may stand in for a longer one: \(standIns.isEmpty ? "none" : standIns)")
         publishDeviceState(device)
         DispatchQueue.main.async {
             self.status = .ready
@@ -327,11 +336,21 @@ final class CameraController: NSObject {
             device.activeVideoMinFrameDuration = frameDuration
             device.activeVideoMaxFrameDuration = frameDuration
 
+            // Slower, less "hunting" focus changes: better for video.
+            // Set before the focus mode: it only takes effect when the mode is set.
+            if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
+            // Continuous autofocus puts faces first by itself (iOS 15.4+, "face-driven autofocus").
             if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
             if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-            // Slower, less "hunting" focus changes: better for video.
-            if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
             device.isSubjectAreaChangeMonitoringEnabled = true
+            // The ultra wide lens must not stand in for the main one. iOS does that when something
+            // comes closer than the main lens can focus, and during a take it doesn't switch back:
+            // the rest of the take is a blown-up crop of the ultra wide, soft all over.
+            // The main lens may still stand in for the telephoto (dim light, close subject).
+            let standIns = device.supportedFallbackPrimaryConstituentDevices.filter { $0.deviceType != .builtInUltraWideCamera }
+            if standIns.count != device.fallbackPrimaryConstituentDevices.count {
+                device.fallbackPrimaryConstituentDevices = standIns
+            }
             device.videoZoomFactor = min(max(zoom.defaultFactor, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
             device.unlockForConfiguration()
         } catch {
@@ -512,6 +531,26 @@ final class CameraController: NSObject {
                         self.displayZoom = factor * self.zoomMultiplier
                     }
                 },
+                // The triple camera changes lenses by itself: for zoom, and for a subject too close
+                // or a scene too dark for the lens that the zoom asks for.
+                device.observe(\.activePrimaryConstituent, options: [.new]) { [weak self] device, _ in
+                    self?.sessionQueue.async { self?.journalFocus("camera lens changed", device: device, always: true) }
+                },
+                // The lens moved: once it has rested for a moment, note where it stopped, while a take
+                // is being recorded. (`isAdjustingFocus` is no use for this: with smooth autofocus
+                // it stayed silent while the lens travelled its whole range.)
+                device.observe(\.lensPosition, options: [.new]) { [weak self] device, _ in
+                    self?.sessionQueue.async {
+                        guard let self, self.movieOutput.isRecording else { return }
+                        self.lensRestCheck?.cancel()
+                        let check = DispatchWorkItem { [weak self] in
+                            guard let self, self.movieOutput.isRecording else { return }
+                            self.journalFocus("focus moved", device: device, always: false)
+                        }
+                        self.lensRestCheck = check
+                        self.sessionQueue.asyncAfter(deadline: .now() + 0.7, execute: check)
+                    }
+                },
             ]
             makeRotationCoordinator(for: device)
 
@@ -525,7 +564,7 @@ final class CameraController: NSObject {
                 forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: device, queue: .main
             ) { [weak self] _ in
                 guard let self, self.hasUserFocusPoint, !self.isFocusLocked else { return }
-                self.resetFocus()
+                self.resetFocus(because: "the scene changed")
             }
         }
     }
@@ -538,15 +577,15 @@ final class CameraController: NSObject {
         hasUserFocusPoint = true
         isFocusLocked = lock
         exposureBias = 0
-        configureFocus(at: point, lock: lock)
+        configureFocus(at: point, lock: lock, note: lock ? "focus and exposure locked by a long press" : "focus point set by a tap")
     }
 
     /// Back to automatic focus/exposure over the whole frame.
-    func resetFocus() {
+    func resetFocus(because reason: String = "the reset button") {
         hasUserFocusPoint = false
         isFocusLocked = false
         exposureBias = 0
-        configureFocus(at: CGPoint(x: 0.5, y: 0.5), lock: false)
+        configureFocus(at: CGPoint(x: 0.5, y: 0.5), lock: false, note: "focus back to automatic (\(reason))")
     }
 
     func setExposureBias(_ bias: Float) {
@@ -559,19 +598,87 @@ final class CameraController: NSObject {
         }
     }
 
-    private func configureFocus(at point: CGPoint, lock: Bool) {
+    private func configureFocus(at point: CGPoint, lock: Bool, note: String) {
         sessionQueue.async { [self] in
             guard let device = videoInput?.device, (try? device.lockForConfiguration()) != nil else { return }
-            defer { device.unlockForConfiguration() }
+            defer {
+                device.unlockForConfiguration()
+                journalFocus(note, device: device, always: true)
+            }
+            focusChangeCount += 1
             // `.autoFocus` / `.autoExpose` adjust once and then hold: that is the lock.
             if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = point }
             let focusMode: AVCaptureDevice.FocusMode = lock ? .autoFocus : .continuousAutoFocus
             if device.isFocusModeSupported(focusMode) { device.focusMode = focusMode }
             if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = point }
-            let exposureMode: AVCaptureDevice.ExposureMode = lock ? .autoExpose : .continuousAutoExposure
-            if device.isExposureModeSupported(exposureMode) { device.exposureMode = exposureMode }
+            if lock, device.isExposureModeSupported(.autoExpose) {
+                device.exposureMode = .autoExpose
+            } else {
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                // A camera without `.autoExpose`: meter at the point, and hold once it has settled.
+                if lock { lockExposureWhenSettled(device, change: focusChangeCount, since: HostClock.now()) }
+            }
             device.setExposureTargetBias(0)
             device.isSubjectAreaChangeMonitoringEnabled = !lock
+        }
+    }
+
+    /// Session queue. Checks every 0.1 s; gives the exposure 0.3 s to start moving
+    /// and at most 2 s to stop.
+    private func lockExposureWhenSettled(_ device: AVCaptureDevice, change: Int, since start: Double) {
+        sessionQueue.asyncAfter(deadline: .now() + 0.1) { [self] in
+            // A newer tap, a reset or another camera has taken over.
+            guard change == focusChangeCount, device == videoInput?.device else { return }
+            let waited = HostClock.now() - start
+            guard waited >= 2 || (waited >= 0.3 && !device.isAdjustingExposure) else {
+                return lockExposureWhenSettled(device, change: change, since: start)
+            }
+            guard device.isExposureModeSupported(.locked), (try? device.lockForConfiguration()) != nil else { return }
+            device.exposureMode = .locked
+            device.unlockForConfiguration()
+            journalFocus("exposure locked", device: device, always: true)
+        }
+    }
+
+    /// Session queue. `always: false` skips moves too small to change the picture.
+    private func journalFocus(_ event: String, device: AVCaptureDevice, always: Bool) {
+        guard always || abs(device.lensPosition - journaledLensPosition) >= 0.05 else { return }
+        journaledLensPosition = device.lensPosition
+        Journal.log("\(event): \(focusSummary(device))")
+    }
+
+    /// Session queue. Which lens is in use and how it focuses, for the journal.
+    /// Lens position runs from 0 (as close as the lens can focus) to 1 (far).
+    private func focusSummary(_ device: AVCaptureDevice) -> String {
+        let mode = switch device.focusMode {
+        case .continuousAutoFocus: "continuous"
+        case .autoFocus: "focusing once"
+        case .locked: "locked"
+        @unknown default: "unknown"
+        }
+        let exposure = switch device.exposureMode {
+        case .continuousAutoExposure: "continuous"
+        case .autoExpose: "metering once"
+        case .locked: "locked"
+        case .custom: "manual"
+        @unknown default: "unknown"
+        }
+        let point = device.focusPointOfInterest
+        return String(
+            format: "%@ lens, zoom %.1f×, focus %@ at (%.2f, %.2f), lens position %.2f, faces first %@, exposure %@",
+            Self.lensName(device.activePrimaryConstituent ?? device),
+            Double(device.videoZoomFactor * Self.zoomLayout(for: device).multiplier),
+            mode, point.x, point.y, device.lensPosition,
+            device.isFaceDrivenAutoFocusEnabled ? "on" : "off", exposure
+        )
+    }
+
+    private static func lensName(_ device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInUltraWideCamera: "ultra wide"
+        case .builtInWideAngleCamera: "wide"
+        case .builtInTelephotoCamera: "telephoto"
+        default: device.localizedName
         }
     }
 
@@ -628,6 +735,10 @@ final class CameraController: NSObject {
         let delegate = RecordingDelegate(session: session, onStart: onStart) { [weak self] error in
             self?.isRecording = false
             self?.recordingDelegate = nil
+            self?.sessionQueue.async {
+                guard let self, let device = self.videoInput?.device else { return }
+                self.journalFocus("take ends", device: device, always: true)
+            }
             onFinish(error)
         }
         recordingDelegate = delegate
@@ -640,6 +751,7 @@ final class CameraController: NSObject {
             if let angle, connection.isVideoRotationAngleSupported(angle) {
                 connection.videoRotationAngle = angle
             }
+            if let device = videoInput?.device { journalFocus("take starts", device: device, always: true) }
             movieOutput.startRecording(to: url, recordingDelegate: delegate)
         }
     }

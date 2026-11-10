@@ -85,6 +85,12 @@ final class RecordingCoordinator {
             // Gentle ramp: crown messages arrive in small steps, the ramp smooths between them.
             self?.camera.setZoom(zoom, animated: true, rate: 4)
         }
+        link.onFocusResetRequest = { [weak self] in
+            guard let self, self.camera.hasUserFocusPoint else { return }
+            self.camera.resetFocus(because: "asked from the watch")
+            // Right away, so the watch's next heartbeat already sees the focus as automatic.
+            self.publishPhoneStatus()
+        }
         link.onAudioFile = { [weak self] info, url in self?.receiveAudio(info, at: url) }
         link.onRecordingLost = { [weak self] id in self?.watchLostRecording(id) }
         link.onBackgroundWatchStatus = { [weak self] status in
@@ -199,6 +205,9 @@ final class RecordingCoordinator {
         case .background:
             // iOS stops the camera in the background; finish the file cleanly ourselves.
             if phase == .recording { stop() }
+            // Like the Camera app: a focus point or lock doesn't outlive the visit. The app can stay
+            // in memory for days, and a forgotten lock would blur every take after it.
+            if camera.hasUserFocusPoint { camera.resetFocus(because: "the app left the screen") }
             camera.stopRunning()
             processor.appDidEnterBackground()
             UIApplication.shared.isIdleTimerDisabled = false
@@ -507,7 +516,8 @@ final class RecordingCoordinator {
             zoom: Double(camera.displayZoom),
             minZoom: Double(camera.minDisplayZoom),
             maxZoom: Double(camera.maxDisplayZoom),
-            zoomSteps: camera.zoomSteps.map(Double.init)
+            zoomSteps: camera.zoomSteps.map(Double.init),
+            focus: camera.isFocusLocked ? .locked : camera.hasUserFocusPoint ? .point : nil
         ))
     }
 

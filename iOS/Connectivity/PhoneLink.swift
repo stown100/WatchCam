@@ -12,6 +12,7 @@ final class PhoneLink: NSObject, WCSessionDelegate {
     var onStartRequest: (@MainActor (UUID, @escaping (WCReply) -> Void) -> Void)?
     var onStopRequest: (@MainActor (UUID) -> Void)?
     var onZoomRequest: (@MainActor (Double) -> Void)?
+    var onFocusResetRequest: (@MainActor () -> Void)?
     /// A watch recording arrived and was moved into the session folder.
     var onAudioFile: (@MainActor (WatchRecordingInfo, URL) -> Void)?
     /// The watch has nothing to send for this take.
@@ -230,6 +231,10 @@ final class PhoneLink: NSObject, WCSessionDelegate {
         case let .setZoom(zoom):
             respond(.ok)
             DispatchQueue.main.async { self.onZoomRequest?(zoom) }
+
+        case .resetFocus:
+            respond(.ok)
+            DispatchQueue.main.async { self.onFocusResetRequest?() }
 
         case let .recordingLost(sessionID):
             respond(.ok)

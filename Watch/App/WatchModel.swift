@@ -157,6 +157,14 @@ final class WatchModel {
     }
     var zoomDial: ZoomDial { ZoomDial(range: zoomRange, steps: phoneStatus?.zoomSteps ?? []) }
 
+    /// A focus point or lock set on the phone's screen, while the camera is there to show it.
+    var phoneFocus: PhoneFocus? {
+        switch phoneState {
+        case .ready, .recording: phoneStatus?.focus
+        default: nil
+        }
+    }
+
     /// While the user turns the crown, the local value wins over what the phone reports.
     /// Long enough to outlast the phone's status, which can lag by about two seconds.
     var isCrownActive: Bool { Date().timeIntervalSince(lastCrownInteraction) < 2.5 }
@@ -194,6 +202,17 @@ final class WatchModel {
         link.send(.setZoom(zoom), timeout: 2) { [weak self] _, _ in
             self?.zoomInFlight = false
             self?.sendPendingZoom()
+        }
+    }
+
+    /// Puts the phone's focus back to automatic.
+    func resetPhoneFocus() {
+        Journal.log("asking the iPhone to reset its focus (was \(phoneStatus?.focus?.rawValue ?? "automatic"))")
+        link.send(.resetFocus, timeout: 2) { [weak self] reply, _ in
+            guard let self else { return }
+            if reply == nil { Journal.log("focus reset didn't reach the iPhone") }
+            // Ask for the phone's status now: the badge goes away only once the phone confirms.
+            self.lastHeartbeat = 0
         }
     }
 
